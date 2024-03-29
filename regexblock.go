@@ -9,14 +9,7 @@ import (
 	"sync"
 	"time"
         "fmt"
-
-	"github.com/zerodha/logf"
 )
-
-var mylog = logf.New(logf.Opts{
-                Level:                logf.DebugLevel,
-                TimestampFormat:      time.RFC3339Nano,
-        })
 
 // Config defines the configuration options for the plugin.
 type Config struct {
@@ -42,38 +35,38 @@ type RegexBlock struct {
 	blockDuration     time.Duration
 	whitelist         []*net.IPNet
 	blockedIPs        map[string]time.Time
+	logger            *pluginLogger
 	mutex             sync.Mutex
 }
 
 // New creates a new instance of the RegexBlock.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	mylog = logf.New(logf.Opts{
-                Level:                logf.DebugLevel,
-                TimestampFormat:      time.RFC3339Nano,
-                DefaultFields:        []any{"plugin", "traefik-regex-block", "pluginName", name},
-        })
-
-        mylog.Info("RegexBlock plugin is starting.")
+	logLevel := "info"
+        if config.EnableDebug {
+	    logLevel = "debug"
+	}
+	logger := newPluginLogger(logLevel, name);
+        logger.Info("RegexBlock plugin is starting.")
 
 	// Setup list of regex patterns
 	regexPatterns := make([]*regexp.Regexp, 0)
 	for _, pattern := range config.RegexPatterns {
 		compiledRegex, err := regexp.Compile(pattern)
 		if err != nil {
-			mylog.Error(fmt.Sprintf("Regex pattern %s is invalid and will not be used.",pattern))
+			logger.Error(fmt.Sprintf("Regex pattern %s is invalid and will not be used.",pattern))
 			continue
 		}
 		regexPatterns = append(regexPatterns, compiledRegex)
-                mylog.Debug(fmt.Sprintf("Adding regex pattern %s",compiledRegex.String()))
+                logger.Debug(fmt.Sprintf("Adding regex pattern %s",compiledRegex.String()))
 	}
 	if len(regexPatterns) == 0 {
-		mylog.Error("There were no valid regex patterns. Plugin will not load.")
+		logger.Error("There were no valid regex patterns. Plugin will not load.")
 		return nil, errors.New("No valid regex patterns found.")
 	}
 
 	// Setup block duration
 	blockDuration := time.Duration(config.BlockDurationMinutes) * time.Minute
-        mylog.Info(fmt.Sprintf("Setting block duration as %d minutes.",config.BlockDurationMinutes))
+        logger.Info(fmt.Sprintf("Setting block duration as %d minutes.",config.BlockDurationMinutes))
 
 	// Setup list of IP addresses to whitelist
 	whitelist := make([]*net.IPNet, 0)
@@ -85,12 +78,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			if ipAddr != nil {
 				ipNet = &net.IPNet{IP: ipAddr, Mask: net.CIDRMask(32, 32)}
 			} else {
-				mylog.Error(fmt.Sprintf("Whitelist IP address %s is invalid and will not be used.",ip))
+				logger.Error(fmt.Sprintf("Whitelist IP address %s is invalid and will not be used.",ip))
 				continue
 			}
 		}
 		whitelist = append(whitelist, ipNet)
-                mylog.Debug(fmt.Sprintf("Adding whitelist IP %s",ip))
+                logger.Debug(fmt.Sprintf("Adding whitelist IP %s",ip))
 	}
 
 	return &RegexBlock{
@@ -100,13 +93,14 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		blockDuration:     blockDuration,
 		whitelist:         whitelist,
 		blockedIPs:        make(map[string]time.Time),
+		logger:            logger,
 	}, nil
 }
 
 // ServeHTTP intercepts the request and blocks it if it matches any of the configured regex patterns.
 func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ip, _, _ := net.SplitHostPort(req.RemoteAddr)
-        mylog.Debug(fmt.Sprintf("Testing IP %s.",ip))
+        p.logger.Debug(fmt.Sprintf("Testing IP %s.",ip))
 
 	// Check if IP is whitelisted
 	if p.isWhitelisted(ip) {
@@ -120,11 +114,11 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Check if IP is blocked
 	if blockTime, ok := p.blockedIPs[ip]; ok {
 		if time.Since(blockTime) < p.blockDuration {
-                        mylog.Debug(fmt.Sprintf("IP %s is still blocked.",ip))
+                        p.logger.Debug(fmt.Sprintf("IP %s is still blocked.",ip))
 			rw.WriteHeader(http.StatusForbidden)
 			return
 		} else {
-                        mylog.Debug(fmt.Sprintf("Removing block for IP %s.",ip))
+                        p.logger.Debug(fmt.Sprintf("Removing block for IP %s.",ip))
 			delete(p.blockedIPs, ip) // Unblock the IP if the block time has expired
 		}
 	}
@@ -133,7 +127,7 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	for _, pattern := range p.regexPatterns {
 		if pattern.MatchString(req.URL.Path) {
 			// Block the IP for the specified duration
-                        mylog.Info(fmt.Sprintf("Setting block for IP %s for requested path %s, based on regex of %s.",ip,req.URL.Path,pattern.String()))
+                        p.logger.Info(fmt.Sprintf("Setting block for IP %s for requested path %s, based on regex of %s.",ip,req.URL.Path,pattern.String()))
 			p.blockedIPs[ip] = time.Now()
 			rw.WriteHeader(http.StatusNotFound)
 			return
@@ -146,19 +140,19 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // isWhitelisted checks if the IP address is whitelisted.
 func (p *RegexBlock) isWhitelisted(ip string) bool {
-        mylog.Debug(fmt.Sprintf("Checking if IP %s is in whitelist",ip))
+        p.logger.Debug(fmt.Sprintf("Checking if IP %s is in whitelist",ip))
 	addr := net.ParseIP(ip)
 	if addr == nil {
-		mylog.Debug(fmt.Sprintf("Could not parse request IP %s",ip))
+		p.logger.Debug(fmt.Sprintf("Could not parse request IP %s",ip))
 		return false
 	}
 
 	for _, ipNet := range p.whitelist {
 		if ipNet.Contains(addr) {
-			mylog.Debug(fmt.Sprintf("IP %s is in whitelist",ip))
+			p.logger.Debug(fmt.Sprintf("IP %s is in whitelist",ip))
 			return true
 		}
 	}
-	mylog.Debug(fmt.Sprintf("IP %s is not in whitelist",ip))
+	p.logger.Debug(fmt.Sprintf("IP %s is not in whitelist",ip))
 	return false
 }
