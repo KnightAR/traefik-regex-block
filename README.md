@@ -7,7 +7,7 @@ The traefix-regex-block plugin provides middleware for Traefik to detect URLs th
 Installation instructions can be found on the [Traefik plugin catalog](https://plugins.traefik.io/plugins/65f7bc4d46079255c9ffd1f0/regex-block).
 
 ## Latest Release
-The current release is version **v0.0.3**. This plugin is still in it's early development phase. However, it is fully functional and is in bug testing phase. If you encounter any problems, please provide feedback by [opening an issue here](https://github.com/tkreiner/traefik-regex-block/issues).
+The current release is version **v0.1.0**. This plugin is still in it's early development phase. However, it is fully functional and is in bug testing phase. If you encounter any problems, please provide feedback by [opening an issue here](https://github.com/tkreiner/traefik-regex-block/issues).
 
 ## Configuration
 The following settings can be used to configure your plugin.
@@ -30,13 +30,20 @@ You provide a list of regex patterns to be used to detect activity you want to b
 
 If you want to keep from blocking specific IP addresses, you can use the whitelist feature. This accepts a list of IP addresses as either an IP address on in CIDR notation.
 
+### Enable Debug Logging - enableDebug
+* Required: No
+* Default: false
+
+Setting this value to true will show all debug logging for the plugin. Otherwise, logging level is set to an info level for output.
+
 ### Example
-The following configuration will detect any URL traffic that includes `/.env` or `/cgi-bin` in the URL. It will block any further requests from the IP address for 2 hours. It then excludes blocking for any requests from the `127.0.0.1` address, or from a `192.168.0.0/16` network.
+The following configuration will detect any URL traffic that includes `/.env` or `/cgi-bin` in the URL. It will block any further requests from the IP address for 2 hours. Logging level is set to show debug messages. It then excludes blocking for any requests from the `127.0.0.1` address, or from a `192.168.0.0/16` network.
 ```yaml
     my-regex-block:
       plugin:
         traefik-regex-block:
           blockDurationMinutes: 120
+          enableDebug: true
           regexPatterns:
             - \/\.env
             - \/cgi-bin

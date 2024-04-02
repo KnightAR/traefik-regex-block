@@ -4,10 +4,11 @@ iconPath: .assets/icon.png
 
 import: github.com/tkreiner/traefik-regex-block
 
-summary: 'Block IPs when URLs match a list of regexes.'
+summary: 'Block IPs when URLs match a list of regex patterns.'
 
 testData:
     blockDurationMinutes: 5
+    enableDebug: true
     regexPatterns:
         - \/\.env
         - \/cgi-bin
