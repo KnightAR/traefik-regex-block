@@ -1,4 +1,4 @@
-package traefik_regex_block
+package traefik-regex-block
 
 import (
     "net"
