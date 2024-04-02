@@ -32,10 +32,11 @@ type RegexBlock struct {
 	next              http.Handler
         name              string
 	regexPatterns     []*regexp.Regexp
-	blockDuration     time.Duration
+	blockDuration     int
 	whitelist         []*net.IPNet
 	blockedIPs        map[string]time.Time
 	logger            *pluginLogger
+        blockMgr          *BlockManager
 	mutex             sync.Mutex
 }
 
@@ -65,8 +66,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	// Setup block duration
-	blockDuration := time.Duration(config.BlockDurationMinutes) * time.Minute
-        logger.Info(fmt.Sprintf("Setting block duration as %d minutes.",config.BlockDurationMinutes))
+	blockDuration := config.BlockDurationMinutes
+        logger.Info(fmt.Sprintf("Setting block duration as %d minutes.",blockDuration))
 
 	// Setup list of IP addresses to whitelist
 	whitelist := make([]*net.IPNet, 0)
@@ -86,6 +87,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
                 logger.Debug(fmt.Sprintf("Adding whitelist IP %s",ip))
 	}
 
+	// Setup a manager for the block list. Currently only
+	// supports an array. Future plans to support Redis and/or MySQL
+	blockMgr := ArrayBlockManager();
+
 	return &RegexBlock{
 		next:              next,
 		name:              name,
@@ -94,12 +99,14 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		whitelist:         whitelist,
 		blockedIPs:        make(map[string]time.Time),
 		logger:            logger,
+		blockMgr:          blockMgr,
 	}, nil
 }
 
 // ServeHTTP intercepts the request and blocks it if it matches any of the configured regex patterns.
 func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ip, _, _ := net.SplitHostPort(req.RemoteAddr)
+	ipNet := net.ParseIP(ip)
         p.logger.Debug(fmt.Sprintf("Testing IP %s.",ip))
 
 	// Check if IP is whitelisted
@@ -112,15 +119,10 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	defer p.mutex.Unlock()
 
 	// Check if IP is blocked
-	if blockTime, ok := p.blockedIPs[ip]; ok {
-		if time.Since(blockTime) < p.blockDuration {
-                        p.logger.Debug(fmt.Sprintf("IP %s is still blocked.",ip))
-			rw.WriteHeader(http.StatusForbidden)
-			return
-		} else {
-                        p.logger.Debug(fmt.Sprintf("Removing block for IP %s.",ip))
-			delete(p.blockedIPs, ip) // Unblock the IP if the block time has expired
-		}
+	if p.blockMgr.IsBlocked(ipNet) {
+		p.logger.Debug(fmt.Sprintf("IP %s is still blocked.",ip))
+		rw.WriteHeader(http.StatusForbidden)
+		return
 	}
 
 	// Check if the request matches any regex pattern
@@ -128,7 +130,7 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		if pattern.MatchString(req.URL.Path) {
 			// Block the IP for the specified duration
                         p.logger.Info(fmt.Sprintf("Setting block for IP %s for requested path %s, based on regex of %s.",ip,req.URL.Path,pattern.String()))
-			p.blockedIPs[ip] = time.Now()
+			p.blockMgr.Block(ipNet,p.blockDuration)
 			rw.WriteHeader(http.StatusNotFound)
 			return
 		}
