@@ -20,6 +20,18 @@ type Config struct {
 	Whitelist            []string `json:"whitelist,omitempty"`
 	EnableDebug          bool     `json:"enableDebug,omitempty"`
 
+	// MaxBlockedIPs limits the number of blocked IPs kept in memory.
+	// Zero or unset means unlimited.
+	MaxBlockedIPs int `json:"maxBlockedIPs,omitempty"`
+
+	// ViolationsBeforeBlock controls how many regex matches are required before blocking.
+	// Zero or unset means 1, which preserves the original immediate-block behavior.
+	ViolationsBeforeBlock int `json:"violationsBeforeBlock,omitempty"`
+
+	// ViolationWindowSeconds controls the rolling window for violation counting.
+	// Only used when ViolationsBeforeBlock > 1. Zero or unset means 300 seconds.
+	ViolationWindowSeconds int `json:"violationWindowSeconds,omitempty"`
+
 	// ClientIPHeader is the HTTP header to trust when the immediate peer is trusted.
 	// Default: CF-Connecting-IP
 	ClientIPHeader string `json:"clientIPHeader,omitempty"`
@@ -33,9 +45,12 @@ type Config struct {
 // CreateConfig creates a default configuration for the plugin.
 func CreateConfig() *Config {
 	return &Config{
-		BlockDurationMinutes: 60, // Default block duration: 1 hour
-		EnableDebug:          false,
-		ClientIPHeader:       "CF-Connecting-IP",
+		BlockDurationMinutes:   60, // Default block duration: 1 hour
+		EnableDebug:            false,
+		ClientIPHeader:         "CF-Connecting-IP",
+		MaxBlockedIPs:          0,   // Unlimited by default
+		ViolationsBeforeBlock:  1,   // Preserve original immediate-block behavior
+		ViolationWindowSeconds: 300, // 5 minutes
 	}
 }
 
@@ -46,10 +61,15 @@ type RegexBlock struct {
 	regexPatterns []*regexp.Regexp
 	blockDuration int
 	whitelist     []*net.IPNet
-	blockedIPs     map[string]time.Time
+	blockedIPs    map[string]time.Time
 	logger        *pluginLogger
 	blockMgr      *BlockManager
+	violationMgr  *ViolationManager
 	mutex         sync.Mutex
+
+	maxBlockedIPs          int
+	violationsBeforeBlock  int
+	violationWindowSeconds int
 
 	clientIPHeader    string
 	trustedProxyCIDRs []string
@@ -97,6 +117,31 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 	logger.Info(fmt.Sprintf("Setting block duration as %d minutes.", blockDuration))
 
+	maxBlockedIPs := config.MaxBlockedIPs
+	if maxBlockedIPs < 0 {
+		maxBlockedIPs = 0
+		logger.Debug("Max blocked IPs was negative. Falling back to unlimited.")
+	}
+	if maxBlockedIPs == 0 {
+		logger.Info("Max blocked IPs is unlimited.")
+	} else {
+		logger.Info(fmt.Sprintf("Setting max blocked IPs as %d.", maxBlockedIPs))
+	}
+
+	violationsBeforeBlock := config.ViolationsBeforeBlock
+	if violationsBeforeBlock <= 0 {
+		violationsBeforeBlock = 1
+		logger.Debug("Violations before block was not set or invalid. Falling back to 1.")
+	}
+	logger.Info(fmt.Sprintf("Setting violations before block as %d.", violationsBeforeBlock))
+
+	violationWindowSeconds := config.ViolationWindowSeconds
+	if violationWindowSeconds <= 0 {
+		violationWindowSeconds = 300
+		logger.Debug("Violation window seconds was not set or invalid. Falling back to 300 seconds.")
+	}
+	logger.Info(fmt.Sprintf("Setting violation window as %d seconds.", violationWindowSeconds))
+
 	// Setup list of IP addresses to whitelist
 	whitelist := make([]*net.IPNet, 0)
 	for _, ip := range config.Whitelist {
@@ -105,9 +150,13 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			// Try parsing as single IP address
 			ipAddr := net.ParseIP(ip)
 			if ipAddr != nil {
-				ipNet = &net.IPNet{IP: ipAddr, Mask: net.CIDRMask(32, 32)}
+				if ipAddr.To4() != nil {
+					ipNet = &net.IPNet{IP: ipAddr, Mask: net.CIDRMask(32, 32)}
+				} else {
+					ipNet = &net.IPNet{IP: ipAddr, Mask: net.CIDRMask(128, 128)}
+				}
 			} else {
-				logger.Error(fmt.Sprintf("Whitelist IP address %s is invalid and will not be used.",ip))
+				logger.Error(fmt.Sprintf("Whitelist IP address %s is invalid and will not be used.", ip))
 				continue
 			}
 		}
@@ -144,23 +193,28 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		logger.Info("No trusted proxy CIDRs configured. Cloudflare CIDRs will be lazily fetched when CF-Connecting-IP is present.")
 	}
 
-	// Setup a manager for the block list. Currently only supports an array.
-	// Future plans to support Redis and/or MySQL
-	blockMgr := ArrayBlockManager();
+	// Setup managers. Currently only supports in-memory storage.
+	// Future plans to support Redis and/or MySQL.
+	blockMgr := ArrayBlockManager(maxBlockedIPs)
+	violationMgr := ArrayViolationManager()
 
 	return &RegexBlock{
-		next:               next,
-		name:               name,
-		regexPatterns:      regexPatterns,
-		blockDuration:      blockDuration,
-		whitelist:          whitelist,
-		blockedIPs:         make(map[string]time.Time),
-		logger:             logger,
-		blockMgr:           blockMgr,
-		clientIPHeader:     clientIPHeader,
-		trustedProxyCIDRs:  config.TrustedProxyCIDRs,
-		trustedProxyNets:   trustedProxyNets,
-		cfCacheTTL:         24 * time.Hour,
+		next:                   next,
+		name:                   name,
+		regexPatterns:          regexPatterns,
+		blockDuration:          blockDuration,
+		whitelist:              whitelist,
+		blockedIPs:             make(map[string]time.Time),
+		logger:                 logger,
+		blockMgr:               blockMgr,
+		violationMgr:           violationMgr,
+		maxBlockedIPs:          maxBlockedIPs,
+		violationsBeforeBlock:  violationsBeforeBlock,
+		violationWindowSeconds: violationWindowSeconds,
+		clientIPHeader:         clientIPHeader,
+		trustedProxyCIDRs:      config.TrustedProxyCIDRs,
+		trustedProxyNets:       trustedProxyNets,
+		cfCacheTTL:             24 * time.Hour,
 	}, nil
 }
 
@@ -201,13 +255,7 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Check if the request matches any regex pattern
 	for _, pattern := range p.regexPatterns {
 		if pattern.MatchString(req.URL.Path) {
-			// Block the IP for the specified duration
-			p.logger.Info(fmt.Sprintf("Setting block for IP %s for requested path %s, based on regex of %s.", ip, req.URL.Path, pattern.String()))
-			err := p.blockMgr.Block(ipNet, p.blockDuration)
-			if err != nil {
-				p.logger.Error(fmt.Sprintf("Failed to block IP %s: %v", ip, err))
-			}
-			rw.WriteHeader(http.StatusNotFound)
+			p.handleRegexMatch(rw, ipNet, ip, req.URL.Path, pattern.String())
 			return
 		}
 	}
@@ -216,10 +264,54 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	p.next.ServeHTTP(rw, req)
 }
 
+func (p *RegexBlock) handleRegexMatch(rw http.ResponseWriter, ipNet net.IP, ip string, path string, pattern string) {
+	if p.violationsBeforeBlock <= 1 {
+		p.logger.Info(fmt.Sprintf("Setting block for IP %s for requested path %s, based on regex of %s.", ip, path, pattern))
+		err := p.blockMgr.Block(ipNet, p.blockDuration)
+		if err != nil {
+			p.logger.Error(fmt.Sprintf("Failed to block IP %s: %v", ip, err))
+		}
+		rw.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	count, err := p.violationMgr.AddViolation(ipNet, p.violationWindowSeconds)
+	if err != nil {
+		p.logger.Error(fmt.Sprintf("Failed to add violation for IP %s: %v", ip, err))
+		rw.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	p.logger.Info(fmt.Sprintf(
+		"Recorded violation %d/%d for IP %s for requested path %s, based on regex of %s.",
+		count,
+		p.violationsBeforeBlock,
+		ip,
+		path,
+		pattern,
+	))
+
+	if count >= p.violationsBeforeBlock {
+		p.logger.Info(fmt.Sprintf("Violation threshold reached. Setting block for IP %s for %d minutes.", ip, p.blockDuration))
+		err = p.blockMgr.Block(ipNet, p.blockDuration)
+		if err != nil {
+			p.logger.Error(fmt.Sprintf("Failed to block IP %s: %v", ip, err))
+		} else {
+			err = p.violationMgr.ClearViolations(ipNet)
+			if err != nil {
+				p.logger.Error(fmt.Sprintf("Failed to clear violations for IP %s: %v", ip, err))
+			}
+		}
+	}
+
+	// Preserve scanner-hiding behavior: regex matches always get 404.
+	rw.WriteHeader(http.StatusNotFound)
+}
+
 // getClientIP returns the IP address that should be checked/blocked.
 //
 // Default behavior:
-//   - Use req.RemoteAddr.
+// - Use req.RemoteAddr.
 //
 // Trusted proxy behavior:
 //   - If the configured client IP header is present and the immediate peer
@@ -427,6 +519,7 @@ func (p *RegexBlock) isWhitelisted(ip string) bool {
 			return true
 		}
 	}
+
 	p.logger.Debug(fmt.Sprintf("IP %s is not in whitelist", ip))
 	return false
 }
