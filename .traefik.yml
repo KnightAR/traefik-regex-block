@@ -1,16 +1,23 @@
 displayName: Regex Block
 type: middleware
 iconPath: .assets/icon.png
-
 import: github.com/tkreiner/traefik-regex-block
-
 summary: 'Block IPs when URLs match a list of regex patterns.'
-
 testData:
-    blockDurationMinutes: 5
-    enableDebug: true
-    regexPatterns:
-        - \/\.env
-        - \/cgi-bin
-    whitelist:
-        - 192.168.0.0/16
+  blockDurationMinutes: 120
+  enableDebug: true
+  maxBlockedIPs: 10000
+  violationsBeforeBlock: 3
+  violationWindowSeconds: 300
+  maxViolationIPs: 50000
+  clientIPHeader: CF-Connecting-IP
+  trustedProxyCIDRs:
+    - 173.245.48.0/20
+    - 103.21.244.0/22
+    - 2606:4700::/32
+  regexPatterns:
+    - \/\.env
+    - \/cgi-bin
+  whitelist:
+    - 127.0.0.1
+    - 192.168.0.0/16
