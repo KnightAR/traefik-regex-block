@@ -1,6 +1,7 @@
 package traefik_regex_block
 
 import (
+	"container/list"
 	"net"
 	"sync"
 	"time"
@@ -13,14 +14,26 @@ type ViolationStorage interface {
 }
 
 type violationEntry struct {
+	ipString  string
 	count     int
 	expiresAt time.Time
 }
 
+type violationListEntry struct {
+	entry violationEntry
+	elem  *list.Element
+}
+
 // ArrayViolationStorage implements ViolationStorage using in-memory storage.
+//
+// maxViolationIPs controls how many unique IPs can be tracked for violations.
+// A value of 0 means unlimited, preserving the original behavior.
+// When the limit is reached, the oldest tracked IP is evicted.
 type ArrayViolationStorage struct {
-	mu         sync.Mutex
-	violations map[string]violationEntry
+	mu              sync.Mutex
+	violations      map[string]*violationListEntry
+	order           *list.List
+	maxViolationIPs int
 }
 
 func (as *ArrayViolationStorage) AddViolation(ip net.IP, windowSeconds int) (int, error) {
@@ -33,37 +46,87 @@ func (as *ArrayViolationStorage) AddViolation(ip net.IP, windowSeconds int) (int
 
 	now := time.Now()
 	ipString := ip.String()
-	entry, ok := as.violations[ipString]
 
-	if !ok || entry.expiresAt.Before(now) {
-		entry = violationEntry{
+	as.pruneExpiredLocked(now)
+
+	trackedEntry, ok := as.violations[ipString]
+	if !ok || trackedEntry.entry.expiresAt.Before(now) {
+		entry := violationEntry{
+			ipString:  ipString,
 			count:     1,
 			expiresAt: now.Add(time.Second * time.Duration(windowSeconds)),
 		}
-	} else {
-		entry.count++
+
+		if ok {
+			as.order.Remove(trackedEntry.elem)
+		}
+
+		elem := as.order.PushBack(ipString)
+		as.violations[ipString] = &violationListEntry{
+			entry: entry,
+			elem:  elem,
+		}
+
+		as.enforceMaxViolationIPsLocked()
+		return entry.count, nil
 	}
 
-	as.violations[ipString] = entry
-	as.pruneExpiredLocked(now)
+	trackedEntry.entry.count++
+	trackedEntry.entry.expiresAt = now.Add(time.Second * time.Duration(windowSeconds))
 
-	return entry.count, nil
+	// Treat each new violation as recent activity for eviction purposes.
+	as.order.MoveToBack(trackedEntry.elem)
+
+	return trackedEntry.entry.count, nil
 }
 
 func (as *ArrayViolationStorage) ClearViolations(ip net.IP) error {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
-	delete(as.violations, ip.String())
+	ipString := ip.String()
+	as.deleteViolationLocked(ipString)
+
 	return nil
 }
 
 func (as *ArrayViolationStorage) pruneExpiredLocked(now time.Time) {
-	for ipString, entry := range as.violations {
-		if entry.expiresAt.Before(now) {
-			delete(as.violations, ipString)
+	for ipString, trackedEntry := range as.violations {
+		if trackedEntry.entry.expiresAt.Before(now) {
+			as.deleteViolationLocked(ipString)
 		}
 	}
+}
+
+func (as *ArrayViolationStorage) enforceMaxViolationIPsLocked() {
+	if as.maxViolationIPs <= 0 {
+		return
+	}
+
+	for len(as.violations) > as.maxViolationIPs {
+		front := as.order.Front()
+		if front == nil {
+			return
+		}
+
+		ipString, ok := front.Value.(string)
+		if !ok {
+			as.order.Remove(front)
+			continue
+		}
+
+		as.deleteViolationLocked(ipString)
+	}
+}
+
+func (as *ArrayViolationStorage) deleteViolationLocked(ipString string) {
+	trackedEntry, ok := as.violations[ipString]
+	if !ok {
+		return
+	}
+
+	as.order.Remove(trackedEntry.elem)
+	delete(as.violations, ipString)
 }
 
 // RedisViolationStorage implements ViolationStorage using a Redis connection.
@@ -85,10 +148,16 @@ type ViolationManager struct {
 	storage ViolationStorage
 }
 
-func ArrayViolationManager() *ViolationManager {
+func ArrayViolationManager(maxViolationIPs int) *ViolationManager {
+	if maxViolationIPs < 0 {
+		maxViolationIPs = 0
+	}
+
 	var storage ViolationStorage
 	storage = &ArrayViolationStorage{
-		violations: make(map[string]violationEntry),
+		violations:      make(map[string]*violationListEntry),
+		order:           list.New(),
+		maxViolationIPs: maxViolationIPs,
 	}
 
 	return &ViolationManager{
