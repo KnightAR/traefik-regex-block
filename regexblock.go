@@ -268,7 +268,7 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Check if the request matches any regex pattern.
 	for _, pattern := range p.regexPatterns {
 		if pattern.MatchString(req.URL.Path) {
-			p.handleRegexMatch(rw, ipNet, ip, req.URL.Path, pattern.String())
+			p.handleRegexMatch(rw, ipNet, ip, req, pattern.String())
 			return
 		}
 	}
@@ -277,9 +277,16 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	p.next.ServeHTTP(rw, req)
 }
 
-func (p *RegexBlock) handleRegexMatch(rw http.ResponseWriter, ipNet net.IP, ip string, path string, pattern string) {
+func (p *RegexBlock) handleRegexMatch(rw http.ResponseWriter, ipNet net.IP, ip string, req *http.Request, pattern string) {
+    scheme := "http"
+    if req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" {
+        scheme = "https"
+    }
+
+    fullURL := fmt.Sprintf("%s://%s%s", scheme, req.Host, req.URL.RequestURI())
+
 	if p.violationsBeforeBlock <= 1 {
-		p.logger.Info(fmt.Sprintf("Setting block for IP %s for requested path %s, based on regex of %s.", ip, path, pattern))
+		p.logger.Info(fmt.Sprintf("Setting block for IP %s for requested url %s, based on regex of %s.", ip, fullURL, pattern))
 		err := p.blockMgr.Block(ipNet, p.blockDuration)
 		if err != nil {
 			p.logger.Error(fmt.Sprintf("Failed to block IP %s: %v", ip, err))
@@ -296,11 +303,11 @@ func (p *RegexBlock) handleRegexMatch(rw http.ResponseWriter, ipNet net.IP, ip s
 	}
 
 	p.logger.Info(fmt.Sprintf(
-		"Recorded violation %d/%d for IP %s for requested path %s, based on regex of %s.",
+		"Recorded violation %d/%d for IP %s for requested url %s, based on regex of %s.",
 		count,
 		p.violationsBeforeBlock,
 		ip,
-		path,
+		fullURL,
 		pattern,
 	))
 
