@@ -240,13 +240,20 @@ func (p *RegexBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+    scheme := "http"
+    if req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https" {
+        scheme = "https"
+    }
+
+    fullURL := fmt.Sprintf("%s://%s%s", scheme, req.Host, req.URL.RequestURI())
+
 	p.logger.Debug(fmt.Sprintf(
-		"Testing IP %s. RemoteAddr=%s, %s=%s, path=%s.",
+		"Testing IP %s. RemoteAddr=%s, %s=%s, URL=%s.",
 		ip,
 		req.RemoteAddr,
 		p.clientIPHeader,
 		req.Header.Get(p.clientIPHeader),
-		req.URL.Path,
+		fullURL,
 	))
 
 	// Check if IP is whitelisted.
